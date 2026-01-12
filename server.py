@@ -5,11 +5,35 @@ from pathlib import Path
 from typing import Optional
 
 from fastmcp import FastMCP
+from fastmcp.server.middleware import Middleware, MiddlewareContext
+from fastmcp.server.dependencies import get_http_headers
+from mcp import McpError
+from mcp.types import ErrorData
 
 WORKSPACE_ROOT = Path(os.environ.get("WORKSPACE_ROOT", "/workspace")).resolve()
-TOKEN = os.environ.get("MCP_BEARER_TOKEN", "").strip()
+EXPECTED = os.environ.get("MCP_BEARER_TOKEN", "").strip()
+
+if not EXPECTED:
+    raise RuntimeError("MCP_BEARER_TOKEN is not set. Add it as a Hugging Face Space Secret.")
+
+def _auth_ok() -> bool:
+    headers = get_http_headers()
+    auth = headers.get("authorization") or headers.get("Authorization") or ""
+    return auth == f"Bearer {EXPECTED}"
+
+class BearerAuthMiddleware(Middleware):
+    async def on_initialize(self, context: MiddlewareContext, call_next):
+        if not _auth_ok():
+            raise McpError(ErrorData(code=-32001, message="Unauthorized"))
+        await call_next(context)
+
+    async def on_request(self, context: MiddlewareContext, call_next):
+        if not _auth_ok():
+            raise McpError(ErrorData(code=-32001, message="Unauthorized"))
+        return await call_next(context)
 
 mcp = FastMCP(name="BMAD Devbox MCP")
+mcp.add_middleware(BearerAuthMiddleware())
 
 def _safe_path(rel: str) -> Path:
     if not rel or rel.strip() == "":
@@ -35,7 +59,6 @@ def _run(cmd: list[str], cwd: Optional[Path] = None) -> str:
 
 @mcp.tool
 def workspace_reset() -> str:
-    """Delete and recreate the workspace directory."""
     if WORKSPACE_ROOT.exists():
         shutil.rmtree(WORKSPACE_ROOT)
     WORKSPACE_ROOT.mkdir(parents=True, exist_ok=True)
@@ -43,7 +66,6 @@ def workspace_reset() -> str:
 
 @mcp.tool
 def git_clone(repo_url: str, dest: str = "repo", branch: str = "main") -> str:
-    """Clone a git repo into the workspace."""
     dest_path = _safe_path(dest)
     if dest_path.exists():
         raise ValueError(f"Destination already exists: {dest_path}")
@@ -52,7 +74,6 @@ def git_clone(repo_url: str, dest: str = "repo", branch: str = "main") -> str:
 
 @mcp.tool
 def read_text(path: str, max_bytes: int = 200_000) -> str:
-    """Read a text file (size-limited)."""
     p = _safe_path(path)
     data = p.read_bytes()
     if len(data) > max_bytes:
@@ -61,7 +82,6 @@ def read_text(path: str, max_bytes: int = 200_000) -> str:
 
 @mcp.tool
 def write_text(path: str, content: str) -> str:
-    """Write a text file (creates parent dirs)."""
     p = _safe_path(path)
     p.parent.mkdir(parents=True, exist_ok=True)
     p.write_text(content, encoding="utf-8")
@@ -69,16 +89,11 @@ def write_text(path: str, content: str) -> str:
 
 @mcp.tool
 def run_tests(cwd: str = "repo") -> str:
-    """Run tests. Default: npm test (customize for your stack)."""
     d = _safe_path(cwd)
     return _run(["npm", "test"], cwd=d)
 
 @mcp.tool
 def bmad_flatten(input_dir: str = "repo", output_file: str = "flattened-codebase.xml") -> str:
-    """
-    Run BMAD's flattener:
-      npx bmad-method flatten --input ... --output ...
-    """
     in_dir = _safe_path(input_dir)
     out_path = _safe_path(output_file)
     out = _run(
@@ -88,12 +103,5 @@ def bmad_flatten(input_dir: str = "repo", output_file: str = "flattened-codebase
     return out + f"\n\nOutput file: {out_path}"
 
 if __name__ == "__main__":
-    # Hugging Face Docker Spaces commonly expose app_port 7860.  [oai_citation:4‡Hugging Face](https://huggingface.co/docs/hub/en/spaces-sdks-docker)
-    mcp.run(
-        transport="streamable-http",
-        host="0.0.0.0",
-        port=7860,
-        path="/mcp",
-        # If your FastMCP version supports built-in auth, use it.
-        # Otherwise, rely on a private Space or a fronting gateway.
-    )
+    port = int(os.environ.get("PORT", "7860"))
+    mcp.run(transport="http", host="0.0.0.0", port=port, path="/mcp")
